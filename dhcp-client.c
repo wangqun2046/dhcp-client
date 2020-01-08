@@ -59,19 +59,20 @@ typedef struct dhcp
 #define DHCP_HARDWARE_TYPE_10_EHTHERNET     1
 
 #define MESSAGE_TYPE_PAD                    0
-#define MESSAGE_TYPE_REQ_SUBNET_MASK        1
+#define MESSAGE_TYPE_SUBNET_MASK            1
 #define MESSAGE_TYPE_ROUTER                 3
 #define MESSAGE_TYPE_DNS                    6
 #define MESSAGE_TYPE_DOMAIN_NAME            15
 #define MESSAGE_TYPE_REQ_IP                 50
 #define MESSAGE_TYPE_DHCP                   53
+#define MESSAGE_TYPE_DHCP_SERVER            54
 #define MESSAGE_TYPE_PARAMETER_REQ_LIST     55
 #define MESSAGE_TYPE_END                    255
 
 #define DHCP_OPTION_DISCOVER                1
 #define DHCP_OPTION_OFFER                   2
 #define DHCP_OPTION_REQUEST                 3
-#define DHCP_OPTION_PACK                    4
+#define DHCP_OPTION_ACK                     4
 
 typedef enum {
     VERBOSE_LEVEL_NONE,
@@ -96,9 +97,12 @@ do{                                                                     \
 
 #define DHCP_MAGIC_COOKIE   0x63825363
 
-verbose_level_t program_verbose_level = VERBOSE_LEVEL_DEBUG;
+verbose_level_t program_verbose_level = VERBOSE_LEVEL_INFO;
 pcap_t *pcap_handle;
 u_int32_t ip;
+u_int32_t dhcp_server;
+u_int32_t mask;
+u_int32_t router;
 
 /*
  * Print the Given ethernet packet in hexa format - Just for debugging
@@ -114,6 +118,7 @@ print_packet(const u_int8_t *data, int len)
             printf("\n %04x :: ", i);
         printf("%02x ", data[i]);
     }
+    printf("\n");
 }
 
 /*
@@ -195,16 +200,66 @@ in_cksum(unsigned short *addr, int len)
 }
 
 /*
+ * Get DHCP options from the bytestream
+ */
+static int
+get_dhcp_option(u_int8_t *packet, u_int8_t code, u_int8_t *data)
+{
+    u_int8_t cur_index = 0;
+    while (packet[cur_index] != MESSAGE_TYPE_END && packet[cur_index + 1] != 0)
+    {
+        u_int8_t cur_code = packet[cur_index];
+        u_int8_t cur_len = packet[cur_index + 1];
+        if (packet[cur_index] == code)
+        {
+            memcpy(data, &packet[cur_index + 2], cur_len);
+            return cur_len;
+        }
+        cur_index += cur_len + 2;
+    }
+    return 0;
+}
+
+/*
  * This function will be called for any incoming DHCP responses
  */
 static void
 dhcp_input(dhcp_t *dhcp)
 {
-    if (dhcp->opcode != DHCP_OPTION_OFFER)
+    if (dhcp->opcode == DHCP_OPTION_OFFER)
+    {
+        PRINT(VERBOSE_LEVEL_INFO, "Received DHCP OFFER message.");
+    } else if (dhcp->opcode == DHCP_OPTION_ACK)
+    {
+        PRINT(VERBOSE_LEVEL_INFO, "Received DHCP ACK message.");
+    } else
+    {
         return;
+    }
 
     /* Get the IP address given by the server */
     ip = ntohl(dhcp->yiaddr);
+
+    ip4_t net_dhcp_server;
+    int len = get_dhcp_option(dhcp->bp_options, MESSAGE_TYPE_DHCP_SERVER, (u_int8_t*)(&net_dhcp_server));
+    if (len)
+    {
+        dhcp_server = ntohl(net_dhcp_server);
+    }
+
+    ip4_t net_router;
+    len = get_dhcp_option(dhcp->bp_options, MESSAGE_TYPE_ROUTER, (u_int8_t*)(&net_router));
+    if (len)
+    {
+        router = ntohl(net_router);
+    }
+
+    ip4_t net_mask;
+    len = get_dhcp_option(dhcp->bp_options, MESSAGE_TYPE_SUBNET_MASK, (u_int8_t*)(&net_mask));
+    if (len)
+    {
+        mask = ntohl(net_mask);
+    }
 
     /* We are done - lets break the loop */
     pcap_breakloop(pcap_handle);
@@ -218,7 +273,10 @@ udp_input(struct udphdr * udp_packet)
 {
     /* Check if there is a response from DHCP server by checking the source Port */
     if (ntohs(udp_packet->uh_sport) == DHCP_SERVER_PORT)
+    {
+        PRINT(VERBOSE_LEVEL_INFO, "this udp packet is dhcp, checksum: %d.", udp_packet->uh_sum);
         dhcp_input((dhcp_t *)((char *)udp_packet + sizeof(struct udphdr)));
+    }
 }
 
 /*
@@ -228,8 +286,14 @@ static void
 ip_input(struct ip * ip_packet)
 {
     /* Care only about UDP - since DHCP sits over UDP */
-    if (ip_packet->ip_p == IPPROTO_UDP)
+    if (ip_packet->ip_p == IPPROTO_UDP) 
+    {
+        PRINT(VERBOSE_LEVEL_INFO, "this ip packet is udp, id: %d.", ip_packet->ip_id);
         udp_input((struct udphdr *)((char *)ip_packet + sizeof(struct ip)));
+    } else if (ip_packet->ip_p == IPPROTO_TCP) 
+    {
+        PRINT(VERBOSE_LEVEL_INFO, "this ip packet is tcp, id: %d.", ip_packet->ip_id);
+    }
 }
 
 /*
@@ -245,8 +309,11 @@ ether_input(u_char *args, const struct pcap_pkthdr *header, const u_char *frame)
     if (program_verbose_level == VERBOSE_LEVEL_DEBUG)
         print_packet(frame, header->len);
 
-    if (htons(eframe->ether_type) == ETHERTYPE_IP)
+    if (htons(eframe->ether_type) == ETHERTYPE_IP) 
+    {
+        PRINT(VERBOSE_LEVEL_INFO, "this frame is ip.");
         ip_input((struct ip *)(frame + sizeof(struct ether_header)));
+    }
 }
 
 /*
@@ -341,14 +408,14 @@ fill_dhcp_option(u_int8_t *packet, u_int8_t code, u_int8_t *data, u_int8_t len)
 }
 
 /*
- * Fill DHCP options
+ * Fill DHCP DISCOVERY options
  */
 static int
 fill_dhcp_discovery_options(dhcp_t *dhcp)
 {
     int len = 0;
     u_int32_t req_ip;
-    u_int8_t parameter_req_list[] = {MESSAGE_TYPE_REQ_SUBNET_MASK, MESSAGE_TYPE_ROUTER, MESSAGE_TYPE_DNS, MESSAGE_TYPE_DOMAIN_NAME};
+    u_int8_t parameter_req_list[] = {MESSAGE_TYPE_SUBNET_MASK, MESSAGE_TYPE_ROUTER, MESSAGE_TYPE_DNS, MESSAGE_TYPE_DOMAIN_NAME};
     u_int8_t option;
 
     option = DHCP_OPTION_DISCOVER;
@@ -381,6 +448,57 @@ dhcp_discovery(u_int8_t *mac)
     dhcp = (dhcp_t *)(((char *)udp_header) + sizeof(struct udphdr));
 
     len = fill_dhcp_discovery_options(dhcp);
+    dhcp_output(dhcp, mac, &len);
+    udp_output(udp_header, &len);
+    ip_output(ip_header, &len);
+    ether_output(packet, mac, len);
+
+    return 0;
+}
+
+/*
+ * Fill DHCP REQUEST options
+ */
+static int
+fill_dhcp_request_options(dhcp_t *dhcp)
+{
+    int len = 0;
+    u_int32_t req_ip, svr_ip;
+    u_int8_t parameter_req_list[] = {MESSAGE_TYPE_SUBNET_MASK, MESSAGE_TYPE_ROUTER, MESSAGE_TYPE_DNS, MESSAGE_TYPE_DOMAIN_NAME};
+    u_int8_t option;
+
+    option = DHCP_OPTION_REQUEST;
+    len += fill_dhcp_option(&dhcp->bp_options[len], MESSAGE_TYPE_DHCP, &option, sizeof(option));
+    req_ip = htonl(ip);
+    len += fill_dhcp_option(&dhcp->bp_options[len], MESSAGE_TYPE_REQ_IP, (u_int8_t *)&req_ip, sizeof(req_ip));
+    len += fill_dhcp_option(&dhcp->bp_options[len], MESSAGE_TYPE_PARAMETER_REQ_LIST, (u_int8_t *)&parameter_req_list, sizeof(parameter_req_list));
+    svr_ip = htonl(dhcp_server);
+    len += fill_dhcp_option(&dhcp->bp_options[len], MESSAGE_TYPE_DHCP_SERVER, (u_int8_t *)&svr_ip, sizeof(svr_ip));
+    option = 0;
+    len += fill_dhcp_option(&dhcp->bp_options[len], MESSAGE_TYPE_END, &option, sizeof(option));
+
+    return len;
+}
+
+/*
+ * Send DHCP REQUEST packet
+ */
+static int
+dhcp_request(u_int8_t *mac)
+{
+    int len = 0;
+    u_char packet[4096];
+    struct udphdr *udp_header;
+    struct ip *ip_header;
+    dhcp_t *dhcp;
+
+    PRINT(VERBOSE_LEVEL_INFO, "Sending DHCP_REQUEST");
+
+    ip_header = (struct ip *)(packet + sizeof(struct ether_header));
+    udp_header = (struct udphdr *)(((char *)ip_header) + sizeof(struct ip));
+    dhcp = (dhcp_t *)(((char *)udp_header) + sizeof(struct udphdr));
+
+    len = fill_dhcp_request_options(dhcp);
     dhcp_output(dhcp, mac, &len);
     udp_output(udp_header, &len);
     ip_output(ip_header, &len);
@@ -435,6 +553,25 @@ main(int argc, char *argv[])
     /* Listen till the DHCP OFFER comes */
     pcap_loop(pcap_handle, -1, ether_input, NULL);
     printf("Got IP %u.%u.%u.%u\n", ip >> 24, ((ip << 8) >> 24), (ip << 16) >> 24, (ip << 24) >> 24);
+    printf("DHCP Server IP: %u.%u.%u.%u\n", dhcp_server >> 24, ((dhcp_server << 8) >> 24), (dhcp_server << 16) >> 24, (dhcp_server << 24) >> 24);
+    printf("Mask: %u.%u.%u.%u\n", mask >> 24, ((mask << 8) >> 24), (mask << 16) >> 24, (mask << 24) >> 24);
+    printf("Router: %u.%u.%u.%u\n", router >> 24, ((router << 8) >> 24), (router << 16) >> 24, (router << 24) >> 24);
+
+    /* Send DHCP REQUEST packet */
+    result = dhcp_request(mac);
+    if (result)
+    {
+        PRINT(VERBOSE_LEVEL_ERROR, "Couldn't send DHCP DISCOVERY on device %s: %s", dev, errbuf);
+        goto done;
+    }
+    PRINT(VERBOSE_LEVEL_INFO, "Waiting for DHCP_ACK");
+    /* Listen till the DHCP OFFER comes */
+    pcap_loop(pcap_handle, -1, ether_input, NULL);
+    /* Listen till the DHCP ACK comes */
+    printf("Got IP %u.%u.%u.%u\n", ip >> 24, ((ip << 8) >> 24), (ip << 16) >> 24, (ip << 24) >> 24);
+    printf("DHCP Server IP: %u.%u.%u.%u\n", dhcp_server >> 24, ((dhcp_server << 8) >> 24), (dhcp_server << 16) >> 24, (dhcp_server << 24) >> 24);
+    printf("Mask: %u.%u.%u.%u\n", mask >> 24, ((mask << 8) >> 24), (mask << 16) >> 24, (mask << 24) >> 24);
+    printf("Router: %u.%u.%u.%u\n", router >> 24, ((router << 8) >> 24), (router << 16) >> 24, (router << 24) >> 24);
 
 done:
     pcap_close(pcap_handle);
